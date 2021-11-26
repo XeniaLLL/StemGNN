@@ -10,7 +10,9 @@ class GLU(nn.Module):
         self.linear_right = nn.Linear(input_channel, output_channel)
 
     def forward(self, x):
-        return torch.mul(self.linear_left(x), torch.sigmoid(self.linear_right(x)))
+        left_val = self.linear_left(x)
+        right_val = self.linear_right(x)
+        return torch.mul(left_val, torch.sigmoid(right_val))
 
 
 class StockBlockLayer(nn.Module):
@@ -44,21 +46,40 @@ class StockBlockLayer(nn.Module):
                 self.GLUs.append(GLU(self.time_step * self.output_channel, self.time_step * self.output_channel))
 
     def spe_seq_cell(self, input):
+        '''
+        DFT--> 1DConv --> GLU --> 1DFT
+        :param input:
+        :return:
+        '''
         batch_size, k, input_channel, node_cnt, time_step = input.size()
         input = input.view(batch_size, -1, node_cnt, time_step)
-        ffted = torch.rfft(input, 1, onesided=False)
-        real = ffted[..., 0].permute(0, 2, 1, 3).contiguous().reshape(batch_size, node_cnt, -1)
-        img = ffted[..., 1].permute(0, 2, 1, 3).contiguous().reshape(batch_size, node_cnt, -1)
+        # ffted = torch.rfft(input, 1, onesided=False) # torch1.7 onesided bool 控制要不要返回一般的结果以防冗余
+        # torch.irfft(input, signal_ndim, normalized=False, onesided=True, signal_sizes=None)
+        # real = ffted[..., 0].permute(0, 2, 1, 3).contiguous().reshape(batch_size, node_cnt, -1)
+        # img = ffted[..., 1].permute(0, 2, 1, 3).contiguous().reshape(batch_size, node_cnt, -1)
+        ffted = torch.fft.fft(input)  # torch.fft.rfft(input, n=None, dim=- 1, norm=None, *, out=None) → Tensor  DFT work todo ?? 先卷积的过程呢
+        real = ffted.real.permute(0, 2, 1, 3).contiguous().reshape(batch_size, node_cnt, -1)
+        img = ffted.imag.permute(0, 2, 1, 3).contiguous().reshape(batch_size, node_cnt, -1)
         for i in range(3):
-            real = self.GLUs[i * 2](real)
+            real = self.GLUs[2 * i](real)
             img = self.GLUs[2 * i + 1](img)
         real = real.reshape(batch_size, node_cnt, 4, -1).permute(0, 2, 1, 3).contiguous()
         img = img.reshape(batch_size, node_cnt, 4, -1).permute(0, 2, 1, 3).contiguous()
         time_step_as_inner = torch.cat([real.unsqueeze(-1), img.unsqueeze(-1)], dim=-1)
-        iffted = torch.irfft(time_step_as_inner, 1, onesided=False)
+        # iffted = torch.irfft(time_step_as_inner, 1, onesided=False)
+        time_step_as_inner = torch.view_as_complex(time_step_as_inner)
+        iffted = torch.fft.ifft(time_step_as_inner).real  # 合理的原因是变幻前没有虚部,复数逆变换之后还是没有,那么GLU 的影响是啥
+        # iffted = torch.fft.ifft(time_step_as_inner)
         return iffted
 
     def forward(self, x, mul_L):
+        '''
+        GFT --> seq-seq Cell --> GConv --> IGFT --> FC --> forecast Y
+                                                --> FC --> reconstruct X^hat
+        :param x:
+        :param mul_L:
+        :return:
+        '''
         mul_L = mul_L.unsqueeze(1)
         x = x.unsqueeze(1)
         gfted = torch.matmul(mul_L, x)
@@ -140,15 +161,20 @@ class Model(nn.Module):
         attention = torch.mean(attention, dim=0)
         degree = torch.sum(attention, dim=1)
         # laplacian is sym or not
-        attention = 0.5 * (attention + attention.T)
+        attention = 0.5 * (attention + attention.T) # 边的权值 对称化
         degree_l = torch.diag(degree)
         diagonal_degree_hat = torch.diag(1 / (torch.sqrt(degree) + 1e-7))
         laplacian = torch.matmul(diagonal_degree_hat,
-                                 torch.matmul(degree_l - attention, diagonal_degree_hat))
-        mul_L = self.cheb_polynomial(laplacian)
+                                 torch.matmul(degree_l - attention, diagonal_degree_hat)) # D^hat * [(D-A)] *D^hat
+        mul_L = self.cheb_polynomial(laplacian) # TODO 卷积了
         return mul_L, attention
 
     def self_graph_attention(self, input):
+        '''
+        self-attention
+        :param input:
+        :return:
+        '''
         input = input.permute(0, 2, 1).contiguous()
         bat, N, fea = input.size()
         key = torch.matmul(input, self.weight_key)
@@ -165,6 +191,11 @@ class Model(nn.Module):
         return torch.matmul(eigenvectors, input)
 
     def forward(self, x):
+        '''
+        input --> Latent Content Layer --> StemGNN(2 stemBlocks) --> connected the forecasted Y and reconstructed X from the both stemBlocks--> Training Loss
+        :param x:
+        :return:
+        '''
         mul_L, attention = self.latent_correlation_layer(x)
         X = x.unsqueeze(1).permute(0, 1, 3, 2).contiguous()
         result = []
