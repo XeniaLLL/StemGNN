@@ -10,6 +10,7 @@ class GLU(nn.Module):
         self.linear_right = nn.Linear(input_channel, output_channel)
 
     def forward(self, x):
+        '''全联接，就是做了一维卷积的work'''
         left_val = self.linear_left(x)
         right_val = self.linear_right(x)
         return torch.mul(left_val, torch.sigmoid(right_val))
@@ -47,29 +48,22 @@ class StockBlockLayer(nn.Module):
 
     def spe_seq_cell(self, input):
         '''
-        DFT--> 1DConv --> GLU --> 1DFT
-        :param input:
-        :return:
-        '''
+                DFT--> 1DConv --> GLU --> 1DFT
+                :param input:
+                :return:
+                '''
         batch_size, k, input_channel, node_cnt, time_step = input.size()
         input = input.view(batch_size, -1, node_cnt, time_step)
-        # ffted = torch.rfft(input, 1, onesided=False) # torch1.7 onesided bool 控制要不要返回一般的结果以防冗余
-        # torch.irfft(input, signal_ndim, normalized=False, onesided=True, signal_sizes=None)
-        # real = ffted[..., 0].permute(0, 2, 1, 3).contiguous().reshape(batch_size, node_cnt, -1)
-        # img = ffted[..., 1].permute(0, 2, 1, 3).contiguous().reshape(batch_size, node_cnt, -1)
-        ffted = torch.fft.fft(input)  # torch.fft.rfft(input, n=None, dim=- 1, norm=None, *, out=None) → Tensor  DFT work todo ?? 先卷积的过程呢
+        ffted = torch.fft.fft(input)
         real = ffted.real.permute(0, 2, 1, 3).contiguous().reshape(batch_size, node_cnt, -1)
         img = ffted.imag.permute(0, 2, 1, 3).contiguous().reshape(batch_size, node_cnt, -1)
         for i in range(3):
-            real = self.GLUs[2 * i](real)
+            real = self.GLUs[i * 2](real)
             img = self.GLUs[2 * i + 1](img)
         real = real.reshape(batch_size, node_cnt, 4, -1).permute(0, 2, 1, 3).contiguous()
         img = img.reshape(batch_size, node_cnt, 4, -1).permute(0, 2, 1, 3).contiguous()
         time_step_as_inner = torch.cat([real.unsqueeze(-1), img.unsqueeze(-1)], dim=-1)
-        # iffted = torch.irfft(time_step_as_inner, 1, onesided=False)
-        time_step_as_inner = torch.view_as_complex(time_step_as_inner)
-        iffted = torch.fft.ifft(time_step_as_inner).real  # 合理的原因是变幻前没有虚部,复数逆变换之后还是没有,那么GLU 的影响是啥
-        # iffted = torch.fft.ifft(time_step_as_inner)
+        iffted = torch.fft.ifft(time_step_as_inner) # # 合理的原因是变幻前没有虚部,复数逆变换之后还是没有,那么GLU 的影响是啥
         return iffted
 
     def forward(self, x, mul_L):
@@ -82,10 +76,10 @@ class StockBlockLayer(nn.Module):
         '''
         mul_L = mul_L.unsqueeze(1)
         x = x.unsqueeze(1)
-        gfted = torch.matmul(mul_L, x)
+        gfted = torch.matmul(mul_L, x) # todo 在外面得到的特征向量矩阵和x 进行相乘--》傅立叶变换了
         gconv_input = self.spe_seq_cell(gfted).unsqueeze(2)
-        igfted = torch.matmul(gconv_input, self.weight)
-        igfted = torch.sum(igfted, dim=1)
+        igfted = torch.matmul(gconv_input, self.weight)  # 1-d conv ???
+        igfted = torch.sum(igfted, dim=1) # todo igft
         forecast_source = torch.sigmoid(self.forecast(igfted).squeeze(1))
         forecast = self.forecast_result(forecast_source)
         if self.stack_cnt == 0:
@@ -110,7 +104,7 @@ class Model(nn.Module):
         nn.init.xavier_uniform_(self.weight_key.data, gain=1.414)
         self.weight_query = nn.Parameter(torch.zeros(size=(self.unit, 1)))
         nn.init.xavier_uniform_(self.weight_query.data, gain=1.414)
-        self.GRU = nn.GRU(self.time_step, self.unit)
+        self.GRU = nn.GRU(self.time_step, self.unit) # input_size, hidden_size, other params are default
         self.multi_layer = multi_layer
         self.stock_block = nn.ModuleList()
         self.stock_block.extend(
@@ -155,24 +149,24 @@ class Model(nn.Module):
         return multi_order_laplacian
 
     def latent_correlation_layer(self, x):
-        input, _ = self.GRU(x.permute(2, 0, 1).contiguous())
-        input = input.permute(1, 0, 2).contiguous()
+        input, _ = self.GRU(x.permute(2, 0, 1).contiguous()) # x--> input :(32,12,140) --> (140,12,140) another 140 are the val of hidden size
+        input = input.permute(1, 0, 2).contiguous() #permute
         attention = self.self_graph_attention(input)
-        attention = torch.mean(attention, dim=0)
-        degree = torch.sum(attention, dim=1)
+        attention = torch.mean(attention, dim=0) # 对batch进行的均值化
+        degree = torch.sum(attention, dim=1)  # 对均值后的attention相当于邻接矩阵了，然后进行度的计算，计算方式是求和，代表对应有几个1按理来说没有边的地方是0
         # laplacian is sym or not
-        attention = 0.5 * (attention + attention.T) # 边的权值 对称化
+        attention = 0.5 * (attention + attention.T) # 对结果进行对称化
         degree_l = torch.diag(degree)
         diagonal_degree_hat = torch.diag(1 / (torch.sqrt(degree) + 1e-7))
         laplacian = torch.matmul(diagonal_degree_hat,
-                                 torch.matmul(degree_l - attention, diagonal_degree_hat)) # D^hat * [(D-A)] *D^hat
-        mul_L = self.cheb_polynomial(laplacian) # TODO 卷积了
+                                 torch.matmul(degree_l - attention, diagonal_degree_hat)) #拉普拉斯是一个 D^(0.5) * (D-A) * D(0.5)的东西
+        mul_L = self.cheb_polynomial(laplacian) # todo为什么是在这里算图卷积的卷积核 # TODO 卷积了
         return mul_L, attention
 
     def self_graph_attention(self, input):
         '''
         self-attention
-        :param input:
+        :param input: the hidden output of the GRU
         :return:
         '''
         input = input.permute(0, 2, 1).contiguous()
@@ -191,12 +185,13 @@ class Model(nn.Module):
         return torch.matmul(eigenvectors, input)
 
     def forward(self, x):
+        #x==>(batch_size, window_size, feature_dims)
         '''
         input --> Latent Content Layer --> StemGNN(2 stemBlocks) --> connected the forecasted Y and reconstructed X from the both stemBlocks--> Training Loss
         :param x:
         :return:
         '''
-        mul_L, attention = self.latent_correlation_layer(x)
+        mul_L, attention = self.latent_correlation_layer(x) # 卷积核， Adjacent
         X = x.unsqueeze(1).permute(0, 1, 3, 2).contiguous()
         result = []
         for stack_i in range(self.stack_cnt):
