@@ -4,7 +4,8 @@ import torch.nn.functional as F
 
 
 class GLU(nn.Module):
-    def __init__(self, input_channel, output_channel):
+
+    def __init__(self,input_channel, output_channel):
         super(GLU, self).__init__()
         self.linear_left = nn.Linear(input_channel, output_channel)
         self.linear_right = nn.Linear(input_channel, output_channel)
